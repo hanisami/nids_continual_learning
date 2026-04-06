@@ -3,17 +3,22 @@ from __future__ import annotations
 import os
 import json
 import argparse
+import time
 from datetime import datetime
 from typing import Optional, Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
 
 # Models & RL
 from models.mlp_classifier import MLPClassifierTorch, MLPConfig
 from models.cgan import ConditionalGANTorch as ConditionalGAN
 from models.replay_buffer import ClassReplayBuffer
+from experiments.cgan_diagnostics import run_cgan_diagnostics
+from experiments.rl_diagnostics import run_rl_diagnostics
+from experiments.reward_sensitivity import run_reward_sensitivity_experiment
 from rl.envs import NIDSHybridEnvGym
 from rl.ppo_agent import PPOAgent, PPOConfig
 from rl.ppo_runner import train_with_ppo
@@ -43,6 +48,12 @@ def build_run_dirs(base: str = "outputs") -> Tuple[str, str]:
     return run_dir, ckpt_dir
 
 
+def ensure_run_dirs(run_dir: str) -> Tuple[str, str]:
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    return run_dir, ckpt_dir
+
+
 def detect_pre_dir(root: str) -> str:
     pre = os.path.join(root, "preprocessed")
     if not os.path.isdir(pre):
@@ -64,6 +75,13 @@ def detect_files(pre_dir: str) -> Tuple[str, str, bool]:
         f"Could not find train/test Parquet or CSV under {pre_dir}. "
         f"Looked for train_df.(parquet|csv) and test_df.(parquet|csv)."
     )
+
+
+def build_label_in_where(ids: List[int]) -> str:
+    if not ids:
+        raise ValueError("build_label_in_where requires at least one label id")
+    joined = ",".join(str(int(i)) for i in ids)
+    return f"label in [{joined}]"
 
 
 def load_label_dict(pre_dir: str) -> Dict[str, int]:
@@ -273,13 +291,15 @@ def plot_curves(run_dir: str, logs: Dict[str, np.ndarray]):
 # Main
 # ------------------------------------------------------------
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Continual Learning (Hybrid: CGAN + Replay) with streaming data sampling")
 
     # Data / experiment
     ap.add_argument("--data_root", type=str, default=".", help="Project root that contains 'preprocessed/'")
     ap.add_argument("--target_class", type=str, required=True,
                     help="Class name to treat as UNSEEN for MLP pretrain (GAN trains on it)")
+    ap.add_argument("--selected_classes", type=str, nargs="+", default=None,
+                    help="Optional subset of classes to keep for the run; must include --target_class")
     # Sampling budgets (keep these modest to avoid OOM)
     ap.add_argument("--seen_cap_total", type=int, default=400_000,
                     help="Max rows to load for seen-class pretrain pool (total across all seen classes)")
@@ -306,6 +326,29 @@ def main():
     ap.add_argument("--gan_lr", type=float, default=1e-3)
     ap.add_argument("--gan_batch", type=int, default=128)
     ap.add_argument("--gan_epochs", type=int, default=8)
+    ap.add_argument("--run_cgan_diagnostics", action="store_true",
+                    help="Run post-training CGAN diagnostics for the target class")
+    ap.add_argument("--cgan_diag_samples", type=int, default=2000,
+                    help="Number of generated samples to use for CGAN diagnostics")
+    ap.add_argument("--cgan_diag_pairs", type=int, default=5000,
+                    help="Number of random pairs used to estimate pairwise distances")
+    ap.add_argument("--cgan_diag_max_plot_samples", type=int, default=1000,
+                    help="Maximum real/generated samples to include in the PCA plot")
+    ap.add_argument("--run_rl_diagnostics", action="store_true",
+                    help="Run post-training RL diagnostics for autonomy, cost, and sample selection")
+    ap.add_argument("--rl_diag_metric", type=str, default="f1",
+                    help="Metric name to emphasize in RL diagnostics (default: f1)")
+    ap.add_argument("--rl_diag_plot", action=argparse.BooleanOptionalAction, default=True,
+                    help="Save the RL sample-selection plot")
+    ap.add_argument("--run_reward_sensitivity", action="store_true",
+                    help="Run a small reward-sensitivity sweep over lambda modes and beta values")
+    ap.add_argument("--reward_beta", type=float, default=0.0,
+                    help="Penalty factor beta applied as a per-sample efficiency cost in the reward")
+    ap.add_argument("--reward_lambda_mode", type=str, default="uniform",
+                    choices=["uniform", "attack_priority", "benign_priority"],
+                    help="Per-class reward weighting scheme")
+    ap.add_argument("--reward_sensitivity_seeds", type=int, nargs="+", default=[42, 7, 123],
+                    help="Seeds to aggregate over for the reward-sensitivity experiment")
 
     # Replay buffer
     ap.add_argument("--replay_cap", type=int, default=20000, help="capacity per class")
@@ -334,17 +377,35 @@ def main():
 
     # Misc
     ap.add_argument("--seed", type=int, default=42)
+    return ap
 
-    args = ap.parse_args()
+
+def run_pipeline(args, run_dir_override: Optional[str] = None) -> Dict[str, object]:
     set_global_seed(args.seed)
 
     # Detect files & labels
     pre_dir = detect_pre_dir(args.data_root)
     train_path, test_path, is_parquet = detect_files(pre_dir)
-    name_to_id = load_label_dict(pre_dir)
-    if args.target_class not in name_to_id:
+    full_name_to_id = load_label_dict(pre_dir)
+    if args.target_class not in full_name_to_id:
         raise SystemExit(f"[error] target_class='{args.target_class}' not found. Available (sample): "
-                         f"{list(name_to_id.keys())[:10]} ...")
+                         f"{list(full_name_to_id.keys())[:10]} ...")
+    if args.selected_classes:
+        missing = [name for name in args.selected_classes if name not in full_name_to_id]
+        if missing:
+            raise SystemExit(f"[error] selected_classes contain unknown labels: {missing}")
+        if args.target_class not in args.selected_classes:
+            raise SystemExit("[error] --selected_classes must include --target_class")
+        active_class_names = list(args.selected_classes)
+    else:
+        active_class_names = list(full_name_to_id.keys())
+
+    active_full_ids = [int(full_name_to_id[name]) for name in active_class_names]
+    seen_active_names = [name for name in active_class_names if name != args.target_class]
+    seen_active_full_ids = [int(full_name_to_id[name]) for name in seen_active_names]
+    target_full_id = int(full_name_to_id[args.target_class])
+    name_to_id = {name: i for i, name in enumerate(active_class_names)}
+    full_id_to_local_id = {int(full_name_to_id[name]): int(name_to_id[name]) for name in active_class_names}
     target_id = int(name_to_id[args.target_class])
     num_classes = len(name_to_id)
 
@@ -352,16 +413,28 @@ def main():
     feature_cols = get_feature_cols_parquet(train_path) if is_parquet else get_feature_cols_csv(train_path)
 
     # Build run dirs
-    run_dir, ckpt_dir = build_run_dirs("outputs")
+    if run_dir_override is None:
+        run_dir, ckpt_dir = build_run_dirs("outputs")
+    else:
+        run_dir, ckpt_dir = ensure_run_dirs(run_dir_override)
     with open(os.path.join(run_dir, "labels.json"), "w", encoding="utf-8") as f:
-        json.dump({"name_to_id": name_to_id, "target": args.target_class, "target_id": target_id}, f, indent=2)
+        json.dump(
+            {
+                "name_to_id": name_to_id,
+                "target": args.target_class,
+                "target_id": target_id,
+                "selected_classes": active_class_names,
+            },
+            f,
+            indent=2,
+        )
 
     # ----------------------- Stream seen pool -----------------------
     print("[main] streaming seen-class pool (for MLP pretrain & replay seeding) ...")
     if is_parquet:
         seen_df = stream_sample_parquet(
             path=train_path,
-            where=f"label!={target_id}",
+            where=build_label_in_where(seen_active_full_ids),
             feature_cols=feature_cols,
             total_cap=args.seen_cap_total,
         )
@@ -369,7 +442,7 @@ def main():
         seen_df = stream_sample_csv(
             path=train_path,
             feature_cols=feature_cols,
-            label_filter=lambda z: int(z) != target_id,
+            label_filter=lambda z: int(z) in set(seen_active_full_ids),
             total_cap=args.seen_cap_total,
         )
     if seen_df.empty:
@@ -384,7 +457,7 @@ def main():
     if is_parquet:
         unseen_df = stream_sample_parquet(
             path=train_path,
-            where=f"label=={target_id}",
+            where=f"label=={target_full_id}",
             feature_cols=feature_cols,
             total_cap=args.unseen_cap,
         )
@@ -392,7 +465,7 @@ def main():
         unseen_df = stream_sample_csv(
             path=train_path,
             feature_cols=feature_cols,
-            label_filter=lambda z: int(z) == target_id,
+            label_filter=lambda z: int(z) == target_full_id,
             total_cap=args.unseen_cap,
         )
     if unseen_df.empty:
@@ -402,15 +475,20 @@ def main():
     print("[main] streaming test split (stratified per class) ...")
     if is_parquet:
         test_df = stream_sample_parquet(
-            path=test_path, where="all", feature_cols=feature_cols,
+            path=test_path, where=build_label_in_where(active_full_ids), feature_cols=feature_cols,
             total_cap=args.test_cap_per_class * num_classes
         )
     else:
         test_df = stream_sample_csv(
-            path=test_path, feature_cols=feature_cols, label_filter=None,
+            path=test_path, feature_cols=feature_cols, label_filter=lambda z: int(z) in set(active_full_ids),
             total_cap=args.test_cap_per_class * num_classes
         )
     test_df = stratify_by_class(test_df, per_class_cap=args.test_cap_per_class, feature_cols=feature_cols)
+
+    # Remap filtered labels to a dense local index for the active class subset.
+    seen_df["label"] = seen_df["label"].map(full_id_to_local_id).astype(int)
+    unseen_df["label"] = unseen_df["label"].map(full_id_to_local_id).astype(int)
+    test_df["label"] = test_df["label"].map(full_id_to_local_id).astype(int)
 
     # Sanity prints
     print(f"[main] seen_df: {seen_df.shape} | unseen_df: {unseen_df.shape} | test_df: {test_df.shape}")
@@ -456,7 +534,30 @@ def main():
         lr=args.gan_lr,
         seed=args.seed,
     )
+    gan_train_start = time.perf_counter()
     gan.train(X_unseen, y_unseen, epochs=args.gan_epochs, verbose=True)
+    cgan_finetune_seconds = time.perf_counter() - gan_train_start
+
+    if args.run_cgan_diagnostics:
+        print("[main] running CGAN diagnostics for the target class ...")
+        diag_metrics = run_cgan_diagnostics(
+            cgan_model=gan,
+            real_features=X_unseen,
+            real_labels=y_unseen,
+            target_label=target_id,
+            output_dir=run_dir,
+            n_generate=args.cgan_diag_samples,
+            batch_size=args.gan_batch,
+            random_state=args.seed,
+            device=getattr(gan, "device", None),
+            n_pairs=args.cgan_diag_pairs,
+            max_plot_samples=args.cgan_diag_max_plot_samples,
+            cgan_finetune_seconds=cgan_finetune_seconds,
+        )
+        status = diag_metrics.get("status", "ok")
+        print(f"[main] CGAN diagnostics status: {status}")
+        if status == "skipped":
+            print(f"[main] CGAN diagnostics reason: {diag_metrics.get('reason', 'n/a')}")
 
     # ----------------------- Replay buffer (seed with seen only) -----------------------
     print("[main] seeding replay buffer with seen classes ...")
@@ -487,6 +588,9 @@ def main():
         max_replay_per_class=args.max_rep,
         max_step_size=args.horizon,
         use_delta_accuracy=args.delta_acc,
+        reward_beta=args.reward_beta,
+        reward_lambda_mode=args.reward_lambda_mode,
+        label_names=list(name_to_id.keys()),
         seed=args.seed,
     )
 
@@ -509,7 +613,19 @@ def main():
     agent = PPOAgent(cfg)
 
     print("[main] training PPO ...")
-    logs = train_with_ppo(env, agent, total_steps=args.ppo_steps, rollout_len=args.rollout_len)
+    rl_history = [] if args.run_rl_diagnostics else None
+    retrain_history = [] if args.run_rl_diagnostics else None
+    rl_timing_info = {} if args.run_rl_diagnostics else None
+    logs = train_with_ppo(
+        env,
+        agent,
+        total_steps=args.ppo_steps,
+        rollout_len=args.rollout_len,
+        rl_history=rl_history,
+        retrain_history=retrain_history,
+        timing_info=rl_timing_info,
+        metric_name=args.rl_diag_metric,
+    )
 
     # ----------------------- Save & Plot -----------------------
     print("[main] saving artifacts ...")
@@ -521,8 +637,65 @@ def main():
 
     final = clf.evaluate(X_test, y_test)
     print(f"[main] Final eval: loss={final['loss']:.4f} acc={final['acc']:.4f} f1={final['f1']:.4f}")
+    y_pred_final = clf.predict(X_test)
+    final_cm = confusion_matrix(y_test, y_pred_final, labels=np.arange(num_classes)).astype(np.float32)
+    row_sums = final_cm.sum(axis=1)
+    final_recalls = np.divide(
+        np.diag(final_cm),
+        row_sums,
+        out=np.zeros(num_classes, dtype=np.float32),
+        where=row_sums > 0,
+    )
+    benign_mask = np.array([("benign" in name.lower()) or ("normal" in name.lower()) for name in name_to_id.keys()], dtype=bool)
+    attack_mask = ~benign_mask
     plot_curves(run_dir, logs)
+    rl_diag_metrics = None
+    if args.run_rl_diagnostics and rl_history is not None and retrain_history is not None and rl_timing_info is not None:
+        print("[main] saving RL diagnostics ...")
+        rl_diag_metrics = run_rl_diagnostics(
+            output_dir=run_dir,
+            rl_history=rl_history,
+            retrain_history=retrain_history,
+            timing_info=rl_timing_info,
+            metric_name=args.rl_diag_metric,
+            plot=args.rl_diag_plot,
+        )
     print(f"[main] run saved to: {run_dir}")
+    return {
+        "run_dir": run_dir,
+        "final_eval": final,
+        "pre_eval": pre_eval,
+        "rl_diag_metrics": rl_diag_metrics or {},
+        "reward_beta": args.reward_beta,
+        "reward_lambda_mode": args.reward_lambda_mode,
+        "reward_lambda_vector": env._lambda_vector.tolist(),
+        "label_names": list(name_to_id.keys()),
+        "final_target_recall": float(final_recalls[target_id]),
+        "final_benign_recall": float(np.mean(final_recalls[benign_mask])) if np.any(benign_mask) else 0.0,
+        "final_mean_attack_recall": float(np.mean(final_recalls[attack_mask])) if np.any(attack_mask) else 0.0,
+    }
+
+
+def main():
+    ap = build_arg_parser()
+    args = ap.parse_args()
+    if args.run_reward_sensitivity:
+        parent_run_dir, _ = build_run_dirs("outputs")
+        beta_values = [0.0, 0.005, 0.02, 0.1]
+        lambda_modes = ["uniform", "attack_priority", "benign_priority"]
+        summary = run_reward_sensitivity_experiment(
+            base_args=args,
+            beta_values=beta_values,
+            lambda_modes=lambda_modes,
+            output_dir=parent_run_dir,
+            runner_fn=run_pipeline,
+            seeds=list(args.reward_sensitivity_seeds),
+        )
+        with open(os.path.join(parent_run_dir, "reward_sensitivity", "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[main] reward sensitivity saved to: {os.path.join(parent_run_dir, 'reward_sensitivity')}")
+        return
+    run_pipeline(args)
 
 
 if __name__ == "__main__":

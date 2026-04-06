@@ -72,6 +72,38 @@ python src/main.py \
   --mlp_epochs 2
 ```
 
+### CGAN diagnostics example
+```bash
+python src/main.py \
+  --data_root . \
+  --target_class DDoS \
+  --gan_epochs 10 \
+  --run_cgan_diagnostics \
+  --cgan_diag_samples 2000
+```
+This adds `outputs/<timestamp>/cgan_diagnostics/` with diversity, similarity, and runtime summaries plus a PCA plot for the target class.
+
+### RL diagnostics example
+```bash
+python src/main.py \
+  --data_root . \
+  --target_class DDoS \
+  --gan_epochs 4 \
+  --run_cgan_diagnostics \
+  --run_rl_diagnostics
+```
+This also adds `outputs/<timestamp>/rl_diagnostics/` with autonomy, runtime, and sample-selection summaries for the PPO-driven adaptation loop.
+
+### Reward sensitivity example
+```bash
+python src/main.py \
+  --data_root . \
+  --target_class DDoS \
+  --gan_epochs 4 \
+  --run_reward_sensitivity
+```
+This runs a small sweep over reward `beta` and `lambda` settings and saves consolidated CSV/JSON results plus a final macro-F1 heatmap under `outputs/<timestamp>/reward_sensitivity/`.
+
 ### Modes
 - `--env real` → uses only real samples.
 - `--env gan` → uses only CGAN-generated samples.

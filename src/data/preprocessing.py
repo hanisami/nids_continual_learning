@@ -204,6 +204,7 @@ def pass2_transform_and_write(
                 continue
 
             y = chunk[class_col].astype(str)
+            split_label_col = "__CLASS_NAME__" if class_col == "label" else class_col
 
             present = [c for c in keep_cols if c in chunk.columns]
             if not present:
@@ -226,12 +227,12 @@ def pass2_transform_and_write(
                     X[c] = (X[c] - mn) / denom
                 X[c] = X[c].astype(np.float32)
 
-            df = pd.concat([X, y.rename(class_col)], axis=1)
-            df["label"] = df[class_col].map(name_to_id).astype(np.int32)
+            df = pd.concat([X, y.rename(split_label_col)], axis=1)
+            df["label"] = df[split_label_col].map(name_to_id).astype(np.int32)
 
             # streaming stratified assignment (0=train, 1=test)
             flags = []
-            for lab in df[class_col].values:
+            for lab in df[split_label_col].values:
                 tr_rem, te_rem = targets[lab]
                 p_test = te_rem / max(1, (tr_rem + te_rem))
                 if (rng.random() < p_test) and te_rem > 0:
@@ -239,6 +240,9 @@ def pass2_transform_and_write(
                 else:
                     flags.append(0); targets[lab][0] -= 1
             df["__SPLIT__"] = np.array(flags, dtype=np.int8)
+
+            if split_label_col == "__CLASS_NAME__":
+                df.drop(columns=[split_label_col], inplace=True)
 
             if parquet:
                 _parquet_append(df, 0, writers)  # train
